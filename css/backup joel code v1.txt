@@ -1,0 +1,173 @@
+
+/**
+ * Mau Master Ingest v3 — EOD + Bulk Buyers
+ * - Robust header matching (order not required)
+ * - Uses formulas for rollups; script only parses & upserts
+ * - Adds menu + triggers + backfill
+ */
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Mau Tools')
+    .addItem('Install/Update Triggers', 'installUpdateTriggers')
+    .addSeparator()
+    .addItem('Backfill EOD (Form Responses 1)', 'backfillEOD')
+    .addItem('Backfill Bulk (Form Responses 2)', 'backfillBulk')
+    .addToUi();
+}
+
+function installUpdateTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('onFormSubmitRouter')
+    .forSpreadsheet(SpreadsheetApp.getActive().getId())
+    .onFormSubmit()
+    .create();
+  SpreadsheetApp.getUi().alert('Triggers installed.');
+}
+
+function onFormSubmitRouter(e) {
+  try {
+    const sh = e.range.getSheet().getName();
+    if (sh === 'Form Responses 1') processEOD_(e.namedValues);
+    else if (sh === 'Form Responses 2') processBulk_(e.namedValues);
+  } catch (err) {
+    Logger.log('Router error: ' + err);
+  }
+}
+
+// ---------- Helpers ----------
+function getSheetOrCreate_(name, headers) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    if (headers && headers.length) sh.getRange(3,1,1,headers.length).setValues([headers]);
+    sh.getRange('A1').setValue(name);
+  }
+  return sh;
+}
+function findFirst_(obj, starts) {
+  for (const k in obj) {
+    const nk = k.trim().toLowerCase();
+    for (const s of starts) {
+      if (nk.indexOf(s.toLowerCase()) === 0) {
+        const v = obj[k];
+        if (v && v[0] !== '') return v[0];
+      }
+    }
+  }
+  return '';
+}
+function toNum_(v){ if(v===''||v==null) return 0; const n=Number(String(v).replace(/[^0-9.-]/g,'')); return isNaN(n)?0:n; }
+function asDate_(v){ if(!v) return new Date(); const d=new Date(v); return isNaN(d)?new Date():d; }
+function sortKeys_(keys, prefix){ return keys.filter(k=>k.toLowerCase().indexOf(prefix)===0).sort((a,b)=>{
+  const na=(String(a).match(/(\d+)/)||[0,0])[1]; const nb=(String(b).match(/(\d+)/)||[0,0])[1]; return na-nb; }); }
+
+// ---------- Backfill ----------
+function backfillEOD() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Form Responses 1');
+  if (!sh) { SpreadsheetApp.getUi().alert('Missing sheet: Form Responses 1'); return; }
+  const vals = sh.getDataRange().getValues(); const header = vals.shift();
+  vals.forEach(r => { const nv={}; header.forEach((h,i)=>nv[h]=[r[i]]); processEOD_(nv); });
+  SpreadsheetApp.getUi().alert('EOD backfill complete.');
+}
+function backfillBulk() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Form Responses 2');
+  if (!sh) { SpreadsheetApp.getUi().alert('Missing sheet: Form Responses 2'); return; }
+  const vals = sh.getDataRange().getValues(); const header = vals.shift();
+  vals.forEach(r => { const nv={}; header.forEach((h,i)=>nv[h]=[r[i]]); processBulk_(nv); });
+  SpreadsheetApp.getUi().alert('Bulk backfill complete.');
+}
+
+// ---------- EOD Processor ----------
+function processEOD_(namedValues) {
+  const ss = SpreadsheetApp.getActive();
+  const tz = ss.getSpreadsheetTimeZone() || 'Africa/Kampala';
+
+  const truck = findFirst_(namedValues, ['Truck ID']);
+  if (!truck) return;
+
+  const timestamp = findFirst_(namedValues, ['Timestamp','Sale Date','Date']);
+  const soldDate = asDate_(timestamp);
+  const dateStr = Utilities.formatDate(soldDate, tz, 'yyyy-MM-dd');
+  const market = findFirst_(namedValues, ['Market','Market/City']);
+  const saleId = truck + '-' + dateStr;
+
+  const keys = Object.keys(namedValues);
+  const priceKeys = sortKeys_(keys.map(k=>k.toLowerCase()), 'price');
+  const bagKeys   = sortKeys_(keys.map(k=>k.toLowerCase()), 'number of bag');
+
+  // Map lower-case to original keys
+  const keyMap = {}; keys.forEach(k=> keyMap[k.toLowerCase()] = k);
+
+  const pairs = [];
+  const len = Math.max(priceKeys.length, bagKeys.length, 4);
+  for (let i=0;i<len;i++) {
+    const pk = keyMap[priceKeys[i]]; const bk = keyMap[bagKeys[i]];
+    const p = toNum_(pk ? namedValues[pk][0] : ''); const b = toNum_(bk ? namedValues[bk][0] : '');
+    if (p>0 && b>0) pairs.push({price:p, bags:b});
+  }
+
+  const formBags  = toNum_(findFirst_(namedValues, ['Total Number of Bags sold']));
+  const formSales = toNum_(findFirst_(namedValues, ['Total Amount of Sales']));
+  const cashBank  = toNum_(findFirst_(namedValues, ['Amount banked or given to manager']));
+  const brokerRet = toNum_(findFirst_(namedValues, ['Amount retained by broker']));
+  const expDetails= findFirst_(namedValues, ['Details of expenses']);
+  const expTotal  = toNum_(findFirst_(namedValues, ['Total amount spent on Expenses']));
+  const loans     = findFirst_(namedValues, ['Bags loaned out']);
+  const notes     = findFirst_(namedValues, ['Additional Notes']);
+
+  // Append parsed lines
+  const linesSh = getSheetOrCreate_('EOD_Parsed', ['SaleID','Date','TruckID','Price (UGX)','Bags','Amount (UGX)','Notes']);
+  pairs.forEach(pr => linesSh.appendRow([saleId, soldDate, truck, pr.price, pr.bags, pr.price*pr.bags, notes]));
+
+  // Upsert header
+  const hdrSh = getSheetOrCreate_('EOD_Sales_Header', ['SaleID','Date','TruckID','Market/City','Form Total Bags','Form Total Sales','Cash Banked','Broker Retained','Expense Total','Expense Details','Bags Loaned','Additional Notes']);
+  const last = hdrSh.getLastRow(); const ids = last>=4 ? hdrSh.getRange(4,1,last-3,1).getValues().flat():[];
+  let idx = ids.indexOf(saleId);
+  if (idx === -1) {
+    hdrSh.appendRow([saleId, soldDate, truck, market, formBags, formSales, cashBank, brokerRet, expTotal, expDetails, loans, notes]);
+  } else {
+    const r = idx+4; hdrSh.getRange(r,2,1,10).setValues([[soldDate, truck, market, formBags, formSales, cashBank, brokerRet, expTotal, expDetails, loans]]);
+    hdrSh.getRange(r,12).setValue(notes);
+  }
+
+  // Expenses
+  const exSh = getSheetOrCreate_('EOD_Expenses', ['SaleID','Date','Category','Amount (UGX)','Comment']);
+  if (brokerRet>0) exSh.appendRow([saleId, soldDate, 'Broker Commission', brokerRet, 'Retained by broker (EOD)']);
+  if (expTotal>0)  exSh.appendRow([saleId, soldDate, 'Misc', expTotal, expDetails || 'EOD expense']);
+}
+
+// ---------- Bulk Processor ----------
+function processBulk_(namedValues) {
+  const ss = SpreadsheetApp.getActive();
+  const tz = ss.getSpreadsheetTimeZone() || 'Africa/Kampala';
+
+  const buyer = findFirst_(namedValues, ['Buyer Name']); if (!buyer) return;
+  const phone = findFirst_(namedValues, ['Phone']);
+  const btype = findFirst_(namedValues, ['Buyer Type']);
+  const loc   = findFirst_(namedValues, ['Location','City']);
+  const date  = asDate_(findFirst_(namedValues, ['Date of Purchase','Date']));
+  const truck = findFirst_(namedValues, ['Truck ID']);
+  const bags  = toNum_(findFirst_(namedValues, ['Number of Bags']));
+  const price = toNum_(findFirst_(namedValues, ['Price per Bag']));
+  const paym  = findFirst_(namedValues, ['Payment Method']);
+  const paid  = toNum_(findFirst_(namedValues, ['Amount Paid Now']));
+  const payDt = asDate_(findFirst_(namedValues, ['Payment Date']));
+  const dueDt = asDate_(findFirst_(namedValues, ['Due Date']));
+  const rcpt  = findFirst_(namedValues, ['Receipt','Invoice']);
+  const broker= findFirst_(namedValues, ['Broker','Agent']);
+  const comm  = toNum_(findFirst_(namedValues, ['Commission per Sack']));
+  const qn    = findFirst_(namedValues, ['Quality Notes']);
+  const com   = findFirst_(namedValues, ['Additional Comments']);
+
+  const saleId = truck + '-' + Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+  const amt = bags*price; const commTot = bags*comm;
+
+  if (bags < 5) return;
+
+  const sh = getSheetOrCreate_('Bulk_Buyer_FromForm', ['SaleID','Date','TruckID','Buyer Name','Buyer Phone','Buyer Type','Location','Bags','Price/Bag','Amount','Payment Method','Amount Paid','Payment Date','Due Date','Receipt/Invoice','Broker','Commission/Sack','Commission Total','Quality Notes','Comments']);
+  sh.appendRow([saleId, date, truck, buyer, phone, btype, loc, bags, price, amt, paym, paid, payDt, dueDt, rcpt, broker, comm, commTot, qn, com]);
+}
